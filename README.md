@@ -1,6 +1,6 @@
 # claudegrid
 
-A Claude Code mod: a Tron-style HUD for Claude Code. It records every session in detail, shows your limits and spend before they surprise
+A Claude Code mod that adds a Tron-style HUD. It records every session in detail, shows your limits and spend before they surprise
 you, tracks subagents live, and has a light-cycle game for the minutes Claude is working.
 
 Needs Claude Code 2.1.287 or later. Terminal only for the drawings (it uses the Raster element); other surfaces get a text line.
