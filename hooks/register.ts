@@ -17,6 +17,9 @@ import { newGame, turn as steer, step as stepGame, togglePause, restart, nextLev
 import { rowFromRecord, parseSummaryArgs, renderSummary, toCsv } from './summary.ts'
 import { renderSummaryPane, mainAggs, RANGE_PRESETS, SVIEWS } from './summaryview.ts'
 import type { SView } from './summaryview.ts'
+import { parseVmStat, parseTopCpu, parseSwapUsage, parsePressure, parsePmsetTherm, parseTempText, parseMeminfo, parseProcStat, cpuBetween, parseLoad, pickLinuxTemp, parsePs } from './sysmon.ts'
+import type { Sample } from './sysmon.ts'
+import { renderSystemPane, systemText } from './sysview.ts'
 import type { Row } from './summary.ts'
 import type { Snapshot, LogEntry, StepEntry } from './hud.ts'
 
@@ -24,6 +27,7 @@ const SCHEMA_VERSION = 3 // the per-turn ledger files are unchanged since v0.3
 const COMMANDS = ['grid', 'claudegrid', 'cgrid'] // first one Claude Code accepts wins (a clash with another mod falls through)
 const PANE = 'claudegrid'
 const TICK_MS = 50
+const SYS_EVERY_MS = 3000 // how often the SYSTEM tab samples while it is on screen
 
 const S: any = {
   inited: false,
@@ -35,8 +39,9 @@ const S: any = {
   active: new Set<string>(), records: {} as Record<string, any>, mainKey: '', fallback: null as any,
   lastRecord: null as any, lastFile: '', lastOrigin: '',
   paneOpen: false, paneSeen: 0, timer: null as any, tick: 0, timerTicks: 0,
-  tab: 'ledger' as 'ledger' | 'game' | 'summary', game: null as any, acc: 0,
-  sum: { rows: [] as Row[], loaded: false, loading: false, loadedAt: 0, note: '', view: 'overview' as SView, days: 30 as number | null, sel: 0, detailCard: null as string | null },
+  tab: 'ledger' as 'ledger' | 'game' | 'summary' | 'system', game: null as any, acc: 0,
+  sys: { sample: null as Sample | null, cpuHist: [] as number[], memHist: [] as number[], tempHist: [] as number[], busy: false, lastAt: 0, error: '', platform: '' as '' | 'darwin' | 'linux' | 'other', memTotal: 0, cores: 0, prevStat: null as any, tempTool: '' as '' | 'osx-cpu-temp' | 'istats' | 'none', thermal: null as any, thermalAt: 0 },
+  sum: { others: [] as Row[], notes: [] as string[], otherSessions: 0, cache: {} as Record<string, { sig: string; rows: Row[] }>, loaded: false, loading: false, loadedAt: 0, note: '', view: 'overview' as SView, days: 30 as number | null, sel: 0, detailCard: null as string | null, pageRows: 10, ringEl: '', lastFocusStep: 0, backView: 'overview' as SView, backSel: 0 },
   totals: { in: 0, out: 0, cacheRead: 0, cacheWrite: 0, steps: 0, tools: 0, toolMs: 0, toolFail: 0 },
   models: {} as Record<string, number>,
   tools: {} as Record<string, { n: number; ms: number; fail: number; estTokens: number }>,
@@ -383,18 +388,31 @@ async function backfill($: any, base: string, session: string): Promise<Row[]> {
   return out
 }
 
-async function loadAllRows($: any): Promise<{ rows: Row[]; note: string }> {
+// A cheap fingerprint of one session folder: rows.json's size and modification time, or the folder's own time while it has no
+// rows.json yet. If it hasn't changed since the last scan, the rows read last time are still right.
+async function sigOf($: any, base: string): Promise<string> {
+  try { const st = await $.fs.stat(`${base}/rows.json`); return `r${st.size}:${Math.round(st.mtimeMs)}` } catch { /* no rows.json yet */ }
+  try { const st = await $.fs.stat(base); return `d${Math.round(st.mtimeMs)}` } catch { return '' }
+}
+
+// Rows from every OTHER session folder. This session is not read from disk: its rows live in memory (S.rows), which is what keeps the
+// summary live between scans. `force` re-reads everything; otherwise only folders whose fingerprint changed are read again.
+async function scanOthers($: any, force = false): Promise<{ rows: Row[]; notes: string[]; sessions: number }> {
   const CAP = 800
   const seen = new Set<string>()
   const rows: Row[] = []
   const add = (list: Row[]) => { for (const r of list) if (r && r.id && !seen.has(r.id)) { seen.add(r.id); rows.push(r) } }
   let entries: any[] = []
-  try { entries = await $.fs.list(S.root) } catch (err) { return { rows: S.rows.slice(), note: `Could not read ${S.root}: ${String(err)}` } }
+  try { entries = await $.fs.list(S.root) } catch (err) { return { rows: [], notes: [`Could not read ${S.root}: ${String(err)}`], sessions: 0 } }
   const dirs = entries.filter(isDir).map((e: any) => str(e.name))
   let backfilled = 0
+  let upgraded = 0
   for (const name of dirs.slice(0, CAP)) {
     if (name === S.id) continue
     const base = `${S.root}/${name}`
+    const sig = await sigOf($, base)
+    const hit = S.sum.cache[name]
+    if (!force && hit && sig !== '' && hit.sig === sig) { add(hit.rows); continue }
     let list = await readJson($, `${base}/rows.json`)
     if (!Array.isArray(list)) {
       list = await backfill($, base, name)
@@ -402,24 +420,67 @@ async function loadAllRows($: any): Promise<{ rows: Row[]; note: string }> {
         backfilled++
         try { await $.fs.write(`${base}/rows.json`, JSON.stringify(list)) } catch { /* cache only */ }
       }
+    } else if (list.some((r: any) => r && r.v !== 2)) {
+      // Rows saved before per-tool and per-model figures existed: upgrade them from the turn files where those survive.
+      // A row with no turn file behind it is kept as it was.
+      const fresh = await backfill($, base, name)
+      if (fresh.length) {
+        const byId = new Map(fresh.map((r) => [r.id, r]))
+        list = list.map((r: any) => (r && r.v !== 2 && byId.has(r.id) ? byId.get(r.id) : r))
+        upgraded++
+        try { await $.fs.write(`${base}/rows.json`, JSON.stringify(list)) } catch { /* cache only */ }
+      }
     }
+    S.sum.cache[name] = { sig: await sigOf($, base), rows: list }
     add(list)
   }
-  add(S.rows) // this session, live
-  const notes: string[] = [`${new Set(rows.map((r) => r.session)).size} sessions in ${S.root}`]
+  for (const k of Object.keys(S.sum.cache)) if (!dirs.includes(k)) delete S.sum.cache[k] // a folder that was deleted
+  const notes: string[] = []
   if (dirs.length > CAP) notes.push(`only the first ${CAP} of ${dirs.length} session folders were read`)
   if (backfilled) notes.push(`${backfilled} older sessions were rebuilt from their turn files`)
-  return { rows, note: notes.join(' · ') }
+  if (upgraded) notes.push(`${upgraded} sessions were upgraded with per-tool and per-model figures`)
+  // Data copied in the wrong shape is the commonest reason for an empty summary: say so instead of showing nothing.
+  const loose = entries.filter((e: any) => /^(turn|bg)-\d+\.json$/.test(str(e?.name))).length
+  if (loose) notes.push(`${loose} loose turn files sit directly in ${S.root}; each session needs its own folder (<session-id>/turn-0001.json, session.json, ...)`)
+  return { rows, notes, sessions: new Set(rows.map((r) => r.session)).size }
 }
 
-async function loadSummary($: any) {
+// Every row there is: other sessions as last scanned, plus this session live from memory.
+function allRows(): Row[] {
+  return S.sum.others.length ? [...S.sum.others, ...S.rows] : S.rows.slice()
+}
+
+function sumNote(): string {
+  const sessions = S.sum.otherSessions + (S.rows.length ? 1 : 0)
+  return [`${sessions} sessions in ${S.root}`, ...S.sum.notes].join(' · ')
+}
+
+// What the SUMMARY tab draws and its keys act on, built fresh each time so a finished turn shows up at once.
+function sumState() {
+  return { ...S.sum, rows: allRows(), note: sumNote(), now: Date.now() }
+}
+
+async function loadAllRows($: any): Promise<{ rows: Row[]; note: string }> {
+  const o = await scanOthers($)
+  S.sum.others = o.rows; S.sum.notes = o.notes; S.sum.otherSessions = o.sessions
+  return { rows: allRows(), note: sumNote() }
+}
+
+// Move the selected row in the SUMMARY table by `delta`, staying inside the list.
+function moveSel(delta: number) {
+  const len = mainAggs(sumState()).length
+  S.sum.sel = clamp(S.sum.sel + delta, 0, Math.max(0, len - 1))
+}
+
+async function loadSummary($: any, force = false) {
   if (S.sum.loading) return
   S.sum.loading = true
   redraw($)
   try {
-    const { rows, note } = await loadAllRows($)
-    S.sum.rows = rows
-    S.sum.note = note
+    const o = await scanOthers($, force)
+    S.sum.others = o.rows
+    S.sum.notes = o.notes
+    S.sum.otherSessions = o.sessions
     S.sum.loaded = true
     S.sum.loadedAt = Date.now()
   } catch (err) { S.lastError = `summary: ${String(err)}` } finally {
@@ -449,6 +510,127 @@ async function openPane($: any): Promise<boolean> {
     S.paneOpen = true
     return true
   } catch (err) { S.lastError = `open pane: ${String(err)}`; return false }
+}
+
+// ---------- system readings (the SYSTEM tab) ----------
+// Read-only: macOS through vm_stat, top, sysctl, pmset and ps; Linux through /proc and /sys. Nothing is stored and nothing is sent anywhere.
+
+async function run1($: any, argv: string[], timeoutMs = 5000): Promise<string> {
+  try { const r = await $.process.run(argv, { timeoutMs }); return str(r?.stdout) } catch { return '' } // a missing command is just "no reading"
+}
+
+async function readText($: any, path: string): Promise<string> {
+  try { const r = await $.fs.read(path); return typeof r === 'string' ? r : str(r?.content) || str(r?.text) } catch { return '' }
+}
+
+async function sampleDarwin($: any, out: Sample) {
+  if (!S.sys.memTotal) S.sys.memTotal = Number((await run1($, ['sysctl', '-n', 'hw.memsize'])).trim()) || 0
+  if (!S.sys.cores) S.sys.cores = Number((await run1($, ['sysctl', '-n', 'hw.ncpu'])).trim()) || 0
+  // `top -l 2` takes about a second (the second sample is the live one), so everything else runs alongside it
+  const [vm, swap, press, top, load] = await Promise.all([
+    run1($, ['vm_stat']), run1($, ['sysctl', '-n', 'vm.swapusage']), run1($, ['sysctl', '-n', 'kern.memorystatus_vm_pressure_level']),
+    run1($, ['top', '-l', '2', '-n', '0', '-s', '1'], 10_000), run1($, ['sysctl', '-n', 'vm.loadavg']),
+  ])
+  out.cores = S.sys.cores || null
+  out.mem = parseVmStat(vm, S.sys.memTotal)
+  if (!out.mem) out.notes.push('Memory: vm_stat gave nothing readable.')
+  out.swap = parseSwapUsage(swap)
+  out.pressure = parsePressure(press)
+  out.cpu = parseTopCpu(top)
+  if (!out.cpu) out.notes.push('CPU: top gave no usage line.')
+  out.load = parseLoad(load)
+  if (Date.now() - S.sys.thermalAt > 10_000) { // thermal state changes slowly
+    S.sys.thermal = parsePmsetTherm(await run1($, ['pmset', '-g', 'therm']))
+    S.sys.thermalAt = Date.now()
+  }
+  out.thermal = S.sys.thermal
+  // a temperature only if a tool that can read one is installed; which one is found once, then remembered
+  if (S.sys.tempTool !== 'none') {
+    let c: number | null = null
+    if (S.sys.tempTool === '' || S.sys.tempTool === 'osx-cpu-temp') { c = parseTempText(await run1($, ['osx-cpu-temp'])); if (c != null) S.sys.tempTool = 'osx-cpu-temp' }
+    if (c == null && (S.sys.tempTool === '' || S.sys.tempTool === 'istats')) { c = parseTempText(await run1($, ['istats', 'cpu', 'temp', '--value-only'])); if (c != null) S.sys.tempTool = 'istats' }
+    if (c != null) out.temp = { c, source: S.sys.tempTool }
+    else if (S.sys.tempTool === '') S.sys.tempTool = 'none'
+  }
+  if (!out.temp) out.notes.push('Temperature: macOS gives no sensor reading without admin rights, so thermal state is shown. osx-cpu-temp (Intel Macs) adds degrees C.')
+}
+
+async function linuxTemp($: any): Promise<{ c: number; source: string } | null> {
+  const zones: { type: string; milli: number }[] = []
+  try {
+    for (const e of await $.fs.list('/sys/class/thermal')) {
+      const n = str(e?.name)
+      if (!n.startsWith('thermal_zone')) continue
+      zones.push({ type: (await readText($, `/sys/class/thermal/${n}/type`)).trim(), milli: Number((await readText($, `/sys/class/thermal/${n}/temp`)).trim()) })
+    }
+  } catch { /* no thermal zones */ }
+  try {
+    for (const e of await $.fs.list('/sys/class/hwmon')) {
+      const n = str(e?.name)
+      if (!n.startsWith('hwmon')) continue
+      const name = (await readText($, `/sys/class/hwmon/${n}/name`)).trim()
+      const milli = Number((await readText($, `/sys/class/hwmon/${n}/temp1_input`)).trim())
+      if (milli) zones.push({ type: name, milli })
+    }
+  } catch { /* no hwmon */ }
+  return pickLinuxTemp(zones)
+}
+
+async function sampleLinux($: any, out: Sample) {
+  let prev = S.sys.prevStat as ReturnType<typeof parseProcStat> | null
+  if (!prev) { prev = parseProcStat(await readText($, '/proc/stat')); await $.clock.sleep(250) } // CPU use needs two reads: take a first one now
+  const cur = parseProcStat(await readText($, '/proc/stat'))
+  S.sys.prevStat = cur
+  const was = prev.find((x) => x.name === 'cpu')
+  const now = cur.find((x) => x.name === 'cpu')
+  if (was && now) out.cpu = cpuBetween(was, now)
+  if (!out.cpu) out.notes.push('CPU: /proc/stat could not be read.')
+  const cores = cur.filter((x) => x.name !== 'cpu')
+  out.cores = cores.length || null
+  out.perCore = cores.length > 1 ? cores.map((c) => { const p = prev.find((x) => x.name === c.name); return (p ? cpuBetween(p, c)?.total : 0) ?? 0 }) : null
+  const mi = parseMeminfo(await readText($, '/proc/meminfo'))
+  out.mem = mi?.mem ?? null
+  out.swap = mi?.swap ?? null
+  if (!out.mem) out.notes.push('Memory: /proc/meminfo could not be read.')
+  out.load = parseLoad(await readText($, '/proc/loadavg'))
+  out.temp = await linuxTemp($)
+  if (!out.temp) out.notes.push('Temperature: no thermal zone or hwmon sensor found (a virtual machine or container often has none).')
+}
+
+async function pollSystem($: any) {
+  if (S.sys.busy) return
+  S.sys.busy = true
+  S.sys.error = ''
+  try {
+    if (!S.sys.platform) {
+      const u = (await run1($, ['uname', '-s'])).trim()
+      S.sys.platform = u === 'Darwin' ? 'darwin' : u === 'Linux' ? 'linux' : 'other'
+    }
+    const out: Sample = { at: Date.now(), platform: S.sys.platform, cores: null, cpu: null, perCore: null, load: null, mem: null, swap: null, pressure: null, temp: null, thermal: null, procs: [], notes: [] }
+    if (S.sys.platform === 'darwin') await sampleDarwin($, out)
+    else if (S.sys.platform === 'linux') await sampleLinux($, out)
+    else out.notes.push('The SYSTEM tab reads macOS and Linux.')
+    const ps = S.sys.platform === 'darwin'
+      ? await run1($, ['ps', '-A', '-o', 'pid=', '-o', 'pcpu=', '-o', 'rss=', '-o', 'comm=', '-r'])
+      : await run1($, ['ps', '-eo', 'pid=,pcpu=,rss=,comm=', '--sort=-pcpu'])
+    out.procs = parsePs(ps)
+    if (out.procs.length === 0) out.notes.push('Processes: ps gave no list.')
+    const keep = (a: number[], v: number | null | undefined) => { if (v != null) { a.push(v); if (a.length > 120) a.splice(0, a.length - 120) } }
+    keep(S.sys.cpuHist, out.cpu?.total)
+    keep(S.sys.memHist, out.mem ? (100 * out.mem.used) / out.mem.total : null)
+    keep(S.sys.tempHist, out.temp?.c)
+    S.sys.sample = out
+  } catch (err) {
+    S.sys.error = String(err).slice(0, 160)
+  } finally {
+    S.sys.busy = false
+    S.sys.lastAt = Date.now()
+    redraw($)
+  }
+}
+
+function sysState() {
+  return { sample: S.sys.sample, cpuHist: S.sys.cpuHist, memHist: S.sys.memHist, tempHist: S.sys.tempHist, loading: S.sys.busy, error: S.sys.error, now: Date.now(), everyMs: SYS_EVERY_MS }
 }
 
 // ---------- recorders ----------
@@ -529,7 +711,7 @@ function helpText(): string {
   const c = '/' + S.cmd
   return [
     'CLAUDEGRID',
-    `${c}                open the console (1 ledger, 2 GRID RUN, 3 SUMMARY, t theme; Esc closes)`,
+    `${c}                open the console (1 ledger, 2 GRID RUN, 3 SUMMARY, 4 SYSTEM, t theme; Esc closes)`,
     `${c} text           session summary in the transcript`,
     `${c} tools|skills|agents|turn N`,
     `${c} summary [card|day|week|month|model|skill|tool|agent|project|session] [ABC-123] [today|7d|30d|all]`,
@@ -538,6 +720,7 @@ function helpText(): string {
     `${c} card [KEY]     one Jira card across every session, all time (default: this session's)`,
     `${c} cards          every card by cost`,
     `${c} export [path]  every turn as CSV (default ~/.claude/claudegrid/claudegrid.csv)`,
+    `${c} system        the SYSTEM tab: CPU, memory, temperature, busiest processes (add text for the transcript)`,
     `${c} today          spend today, across sessions`,
     `${c} budget N|off   daily budget in USD; toasts at 80% and 100%`,
     `${c} theme [soft|neon]`,
@@ -651,7 +834,8 @@ export function register(on: any, _options: any) {
           S.timerTicks += 1
           const visible = paneVisible()
           if (visible && S.tick % 1200 === 0) refreshUsage($).catch(() => {})
-          if (visible && S.tab === 'summary' && S.sum.loaded && !S.sum.loading && Date.now() - S.sum.loadedAt > 60_000) loadSummary($).catch(() => {})
+          if (visible && S.tab === 'system' && !S.sys.busy && Date.now() - S.sys.lastAt > SYS_EVERY_MS) pollSystem($).catch(() => {})
+          if (visible && S.tab === 'summary' && S.sum.loaded && !S.sum.loading && Date.now() - S.sum.loadedAt > 15_000) loadSummary($).catch(() => {})
           if (S.game?.state === 'running' && !(visible && S.tab === 'game')) {
             S.game.state = 'paused' // never run a game nobody can see
           }
@@ -737,12 +921,24 @@ export function register(on: any, _options: any) {
       S.sum.view = args.card ? 'detail' : args.dim ? (args.dim as SView) : word === 'cards' ? 'card' : 'overview'
       S.tab = 'summary'
       await loadSummary($)
-      if (!(await openPane($))) return { text: renderSummary(S.sum.rows, args, S.sum.note) } // no pane available: fall back to text
+      if (!(await openPane($))) return { text: renderSummary(allRows(), args, sumNote()) } // no pane available: fall back to text
       redraw($)
       return {}
     }
 
     if (word === 'export') return { text: await exportCsv($, tail) }
+
+    if (word === 'system' || word === 'sys') {
+      if (/^text(\s|$)/i.test(tail)) {
+        await pollSystem($)
+        return { text: systemText(sysState()) }
+      }
+      S.tab = 'system'
+      pollSystem($).catch(() => {})
+      if (!(await openPane($))) { await pollSystem($); return { text: systemText(sysState()) } } // no pane available: fall back to text
+      redraw($)
+      return {}
+    }
 
     if (word === '' || word === 'console') {
       if (await openPane($)) return {}
@@ -930,6 +1126,38 @@ export function register(on: any, _options: any) {
     return next(e)
   })
 
+  // ---------- list navigation in the SUMMARY tab ----------
+  // The arrow keys and Tab move the focus ring between controls; the wheel and the page keys arrive as scroll events.
+  // Both are turned into "move the selected row", so a long list of cards, tools or projects can be walked by keyboard or wheel.
+  on('ui.focus', async ($: any, e: any, next: any) => {
+    if (e?.requestId !== PANE || S.tab !== 'summary') return next(e)
+    const el = str(e?.element)
+    if (el === 'sum-prev' || el === 'sum-next') {
+      if (S.sum.ringEl === 'sum-open') {
+        // the ring was on OPEN and an arrow (or Tab, or a click) reached for a neighbour: step the list, keep the ring on OPEN
+        moveSel(el === 'sum-next' ? 1 : -1)
+        S.sum.lastFocusStep = Date.now()
+        redraw($)
+        return {}
+      }
+      return next({ ...e, element: 'sum-open' }) // the ring was somewhere else: bring it to the list control first
+    }
+    S.sum.ringEl = el
+    return next(e)
+  })
+
+  on('ui.scroll', async ($: any, e: any, next: any) => {
+    if (e?.requestId !== PANE || S.tab !== 'summary' || !S.sum.loaded) return next(e)
+    const by = num(e?.by)
+    if (by !== 0) {
+      // a page key asks for a whole body of rows: jump one page of the table. A wheel tick or a single row moves one row.
+      const bodyRows = num(e?.bodyRows)
+      moveSel(bodyRows > 0 && Math.abs(by) >= bodyRows ? Math.sign(by) * Math.max(1, S.sum.pageRows - 1) : by)
+      redraw($)
+    }
+    return {} // the table scrolls itself; leave the window where it is
+  })
+
   // ---------- the grid ----------
   on('ui.render', { component: 'AbovePrompt' }, async ($: any, e: any, next: any) => {
     const { Box, Text, Raster } = $.ui.resolve(e)
@@ -960,26 +1188,31 @@ export function register(on: any, _options: any) {
     const total = dock ? clamp(num(e?.props?.scroll?.bodyRows) || 24, 8, 60) : 16
     const isGame = S.tab === 'game'
     const isSummary = S.tab === 'summary'
-    const rows = Math.max(8, total - 1 - (isGame || isSummary ? 1 : 0)) // one row for the tabs, one for the keys
+    const isSystem = S.tab === 'system'
+    const rows = Math.max(8, total - 1 - (isGame || isSummary || isSystem ? 1 : 0)) // one row for the tabs, one for the keys
 
     // The arena always matches the window. A resize starts a fresh run (scores are kept).
     const L = layout(cols, rows)
     if (isGame && (!S.game || S.game.w !== L.gw || S.game.h !== L.gh)) S.game = newGame(L.gw, L.gh, S.game)
 
     if (isSummary && !S.sum.loaded && !S.sum.loading) loadSummary($).catch(() => {})
-    const canvas = isSummary
-      ? renderSummaryPane({ ...S.sum, now: Date.now() }, cols, rows)
-      : renderConsole({ ...snapshot(), view: S.tab === 'summary' ? 'ledger' : S.tab, game: isGame ? S.game : null }, cols, rows)
+    if (isSystem && !S.sys.sample && !S.sys.busy) pollSystem($).catch(() => {})
+    const canvas = isSystem
+      ? renderSystemPane(sysState(), cols, rows)
+      : isSummary
+      ? renderSummaryPane({ ...sumState(), onLayout: (i) => { S.sum.pageRows = Math.max(1, i.visibleRows) } }, cols, rows)
+      : renderConsole({ ...snapshot(), view: S.tab === 'game' ? 'game' : 'ledger', game: isGame ? S.game : null }, cols, rows)
     const again = () => { try { $.ui.invalidate('ui.render') } catch { /* cosmetic */ } }
 
     // Hotkeys only work while this pane has keyboard focus (the mod never reads the keyboard itself).
-    const tabBtn = (name: 'ledger' | 'game' | 'summary', label: string, hotkey: string) =>
+    const tabBtn = (name: 'ledger' | 'game' | 'summary' | 'system', label: string, hotkey: string) =>
       Button({
         key: 'tab-' + name, label, hotkey, plain: true, dimColor: S.tab !== name,
         onPress: () => {
           S.tab = name
           if (name !== 'game' && S.game?.state === 'running') S.game.state = 'paused'
           if (name === 'summary') loadSummary($).catch(() => {})
+          if (name === 'system') pollSystem($).catch(() => {})
           again()
         },
       })
@@ -992,40 +1225,54 @@ export function register(on: any, _options: any) {
         try { await $.store.set('theme2', name) } catch { /* cosmetic */ }
       },
     })
-    const tabs = Box({ flexDirection: 'row', columnGap: 3, children: [tabBtn('ledger', 'LEDGER', '1'), tabBtn('game', 'GRID RUN', '2'), tabBtn('summary', 'SUMMARY', '3'), themeBtn] })
+    const tabs = Box({ flexDirection: 'row', columnGap: 3, children: [tabBtn('ledger', 'LEDGER', '1'), tabBtn('game', 'GRID RUN', '2'), tabBtn('summary', 'SUMMARY', '3'), tabBtn('system', 'SYSTEM', '4'), themeBtn] })
 
     const key = (k: string, label: string, hotkey: string, fn: () => void) =>
       Button({ key: 'game-' + k, label, hotkey, plain: true, onPress: () => { if (S.game) fn(); again() } })
-    const sumKey = (k: string, label: string, hotkey: string, fn: () => void | Promise<void>) =>
-      Button({ key: 'sum-' + k, label, hotkey, plain: true, onPress: async () => { await fn(); again() } })
-    const sumLen = () => mainAggs({ ...S.sum, now: Date.now() }).length
-    const keys = isSummary
+    const narrowKeys = cols < 80 // the key row has to fit on one line
+    const gapKeys = narrowKeys ? 1 : 2
+    const sumKey = (k: string, label: string, hotkey: string, fn: () => void | Promise<void>, extra: { autoFocus?: true } = {}) =>
+      Button({ key: 'sum-' + k, label, hotkey, plain: true, ...extra, onPress: async () => { await fn(); again() } })
+    // Arrow keys move the focus ring between controls, so the list gets a d-pad: prev, OPEN, next. The ring rests on OPEN
+    // (Enter opens the card), and when an arrow, Tab or a click lands it on prev or next, the ui.focus hook steps the list.
+    const stepFromPress = (d: number) => () => { if (Date.now() - S.sum.lastFocusStep > 300) moveSel(d) } // a click already stepped it at ui.focus
+    const openSelected = () => {
+      if (S.sum.view !== 'overview' && S.sum.view !== 'card') return
+      const a = mainAggs(sumState())[S.sum.sel]
+      if (a && a.key !== '(no card)') {
+        S.sum.backView = S.sum.view // BACK returns to this view and this row, so a long list keeps its place
+        S.sum.backSel = S.sum.sel
+        S.sum.detailCard = a.key; S.sum.view = 'detail'; S.sum.sel = 0
+      }
+    }
+    const keys = isSystem
       ? Box({
-          flexDirection: 'row', columnGap: 2,
+          flexDirection: 'row', columnGap: gapKeys,
+          children: [sumKey('sys-refresh', 'REFRESH', 'u', () => { S.sys.tempTool = ''; S.sys.thermalAt = 0; return pollSystem($) })], // also looks for a newly installed temperature tool
+        })
+      : isSummary
+      ? Box({
+          flexDirection: 'row', columnGap: gapKeys,
           children: [
-            sumKey('range', 'RANGE', 'r', () => { const i = RANGE_PRESETS.indexOf(S.sum.days); S.sum.days = RANGE_PRESETS[(i + 1) % RANGE_PRESETS.length]; S.sum.sel = 0 }),
+            sumKey('prev', '↑', 'p', stepFromPress(-1)),
+            sumKey('open', 'OPEN', 'o', openSelected, { autoFocus: true }),
+            sumKey('next', '↓', 'n', stepFromPress(1)),
+            sumKey('range', narrowKeys ? 'RNG' : 'RANGE', 'r', () => { const i = RANGE_PRESETS.indexOf(S.sum.days); S.sum.days = RANGE_PRESETS[(i + 1) % RANGE_PRESETS.length]; S.sum.sel = 0 }),
             sumKey('view', 'VIEW', 'v', () => { const i = SVIEWS.indexOf(S.sum.view); S.sum.view = SVIEWS[(i + 1) % SVIEWS.length]; S.sum.detailCard = null; S.sum.sel = 0 }),
-            sumKey('next', 'NEXT', 'n', () => { S.sum.sel = Math.min(S.sum.sel + 1, Math.max(0, sumLen() - 1)) }),
-            sumKey('prev', 'PREV', 'p', () => { S.sum.sel = Math.max(0, S.sum.sel - 1) }),
-            sumKey('open', 'OPEN', 'o', () => {
-              if (S.sum.view !== 'overview' && S.sum.view !== 'card') return
-              const a = mainAggs({ ...S.sum, now: Date.now() })[S.sum.sel]
-              if (a && a.key !== '(no card)') { S.sum.detailCard = a.key; S.sum.view = 'detail'; S.sum.sel = 0 }
-            }),
-            sumKey('back', 'BACK', 'b', () => { if (S.sum.view === 'detail') { S.sum.view = 'overview'; S.sum.detailCard = null; S.sum.sel = 0 } }),
-            sumKey('refresh', 'REFRESH', 'u', () => loadSummary($)),
-            sumKey('export', 'EXPORT', 'x', async () => { await toast($, (await exportCsv($, '')).split('\n')[0]) }),
+            sumKey('back', 'BACK', 'b', () => { if (S.sum.view === 'detail') { S.sum.view = S.sum.backView; S.sum.detailCard = null; S.sum.sel = S.sum.backSel; S.sum.backView = 'overview'; S.sum.backSel = 0 } }),
+            sumKey('refresh', narrowKeys ? 'LOAD' : 'REFRESH', 'u', () => loadSummary($, true)),
+            sumKey('export', narrowKeys ? 'CSV' : 'EXPORT', 'x', async () => { await toast($, (await exportCsv($, '')).split('\n')[0]) }),
           ],
         })
       : isGame
       ? Box({
-          flexDirection: 'row', columnGap: 2,
+          flexDirection: 'row', columnGap: gapKeys,
           children: [
             key('up', 'UP', 'w', () => steer(S.game, 'up')),
             key('left', 'LEFT', 'a', () => steer(S.game, 'left')),
             key('down', 'DOWN', 's', () => steer(S.game, 'down')),
             key('right', 'RIGHT', 'd', () => steer(S.game, 'right')),
-            key('new', 'NEW RUN', 'g', () => { S.game = restart(S.game) }),
+            key('new', narrowKeys ? 'NEW' : 'NEW RUN', 'g', () => { S.game = restart(S.game) }),
             key('pause', 'PAUSE', 'p', () => togglePause(S.game)),
             key('level', 'LEVEL', 'l', () => { S.game = nextLevel(S.game) }),
           ],

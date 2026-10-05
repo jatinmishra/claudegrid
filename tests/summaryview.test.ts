@@ -38,3 +38,37 @@ test('loading and empty states draw instead of crashing; narrow panes still work
   expect(renderSummaryPane(state(), 60, 16).cols).toBe(60)
   expect(rangeLabel(null)).toBe('all time')
 })
+
+const text = (c: { ch: number[] }): string => String.fromCodePoint(...c.ch)
+
+test('a docked pane about 89 columns wide still shows the side panels, in overview and in a card', () => {
+  const o = text(renderSummaryPane(state(), 89, 40))
+  expect(o.includes('BY DAY')).toBe(true)
+  expect(o.includes('BY MODEL')).toBe(true)
+  expect(o.includes('TOP TOOLS')).toBe(true)
+  const d = text(renderSummaryPane(state({ view: 'detail', detailCard: 'ABC-1' }), 89, 40))
+  expect(d.includes('SESSIONS')).toBe(true)
+  expect(d.includes('BY MODEL')).toBe(true)
+  expect(d.includes('BY DAY')).toBe(true)
+})
+
+test('a narrow pane stacks the panels under the main table when it is tall enough', () => {
+  const n = text(renderSummaryPane(state(), 64, 40))
+  expect(n.includes('BY DAY')).toBe(true)
+  expect(n.includes('BY MODEL')).toBe(true)
+  const short = text(renderSummaryPane(state(), 64, 12))
+  expect(short.includes('BY CARD')).toBe(true)
+})
+
+test('the tool and model views draw their own columns in the pane', () => {
+  const withStats = (r: Row): Row => ({ ...r, v: 2, toolStats: { Bash: { n: 2, ms: 6000, fail: 1, est: 600 }, Read: { n: 1, ms: 50, fail: 0, est: 900 } }, modelStats: { m1: { steps: 2, in: 10, out: 500, cacheRead: 9000, cacheWrite: 100 } }, tools: { Bash: 2, Read: 1 } })
+  const rows = state().rows.map(withStats)
+  const tool = text(renderSummaryPane(state({ rows, view: 'tool' }), 120, 30))
+  expect(tool.includes('CALLS')).toBe(true)
+  expect(tool.includes('FAIL')).toBe(true)
+  const model = text(renderSummaryPane(state({ rows, view: 'model' }), 120, 30))
+  expect(model.includes('REQS')).toBe(true)
+  const skill = text(renderSummaryPane(state({ rows, view: 'skill' }), 120, 30))
+  expect(skill.includes('COST*')).toBe(true)
+  expect(skill.includes('whole turns')).toBe(true)
+})

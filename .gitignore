@@ -1,2 +1,11 @@
+# Claude Code writes these into the plugin folder each time it loads or reloads the plugin
+# (type declarations for editing the hooks, and a tsconfig that points at them). Do not commit them.
+.claude-plugin/types/
+tsconfig.json
+
+# macOS
 .DS_Store
+
+# local tooling
 node_modules/
+*.log

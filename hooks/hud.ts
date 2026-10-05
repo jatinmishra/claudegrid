@@ -344,7 +344,7 @@ function drawLedgerView(cv: Canvas, s: Snapshot, rx: number, rw: number, body: n
       cv.text(ix + 8, y, text.slice(8, 17), stopColor, DEFAULT, imax) // stop reason
     })
   }
-  if (hintY > shown.length) cv.text(ix, hintY, '2 GRID RUN (light cycles) · 3 SUMMARY', C.dim, DEFAULT, imax)
+  if (hintY > shown.length) cv.text(ix, hintY, '2 GRID RUN · 3 SUMMARY · 4 SYSTEM', C.dim, DEFAULT, imax)
 }
 
 export function renderConsole(s: Snapshot, cols: number, rows: number): Canvas {
