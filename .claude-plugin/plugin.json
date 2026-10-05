@@ -1,0 +1,8 @@
+{
+  "name": "claudegrid",
+  "version": "1.3.0",
+  "description": "A Tron-style HUD for Claude Code: a per-turn ledger (tokens, tools, skills, agents, Jira card, cost), limit bars, an agent radar, a cross-session summary and light-cycle GRID RUN.",
+  "author": { "name": "Jatin Mishra" },
+  "license": "MIT",
+  "keywords": ["ledger", "tokens", "usage", "hud", "agents", "jira", "game", "tron"]
+}
