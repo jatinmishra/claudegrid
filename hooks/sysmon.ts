@@ -27,7 +27,6 @@ export interface Sample {
   mem: Mem | null
   swap: { total: number; used: number } | null
   pressure: Pressure | null
-  temp: { c: number; source: string } | null
   thermal: Thermal | null
   procs: Proc[]
   notes: string[] // what could not be read, and why
@@ -94,14 +93,6 @@ export function parsePmsetTherm(text: string): Thermal {
   return { state: 'nominal' }
 }
 
-// osx-cpu-temp prints "61.2°C" (it reads 0.0 on Apple Silicon, which is treated as no reading); istats --value-only prints "61.20".
-export function parseTempText(text: string): number | null {
-  const t = text.trim()
-  const m = /(-?\d+(?:\.\d+)?)\s*°?\s*C\b/.exec(t) ?? /^(-?\d+(?:\.\d+)?)$/.exec(t)
-  const v = m ? Number(m[1]) : NaN
-  return Number.isFinite(v) && v > 0 && v < 150 ? v : null
-}
-
 // ---------- Linux ----------
 
 export function parseMeminfo(text: string): { mem: Mem; swap: { total: number; used: number } } | null {
@@ -157,16 +148,6 @@ export function cpuBetween(prev: CpuTimes, cur: CpuTimes): CpuUse | null {
 export function parseLoad(text: string): [number, number, number] | null {
   const n = [...text.matchAll(/\d+\.\d+/g)].map((m) => Number(m[0]))
   return n.length >= 3 ? [n[0], n[1], n[2]] : null
-}
-
-// Thermal zones, as read from /sys/class/thermal (millidegrees). Prefer one that names the CPU; else the hottest sane reading.
-export function pickLinuxTemp(zones: { type: string; milli: number }[]): { c: number; source: string } | null {
-  const sane = zones.filter((z) => Number.isFinite(z.milli) && z.milli > 0 && z.milli < 150_000)
-  if (sane.length === 0) return null
-  const cpu = sane.filter((z) => /x86_pkg_temp|cpu|k10temp|coretemp|package|tctl|soc/i.test(z.type))
-  const pool = cpu.length ? cpu : sane
-  const best = pool.reduce((a, b) => (b.milli > a.milli ? b : a))
-  return { c: best.milli / 1000, source: best.type || 'thermal zone' }
 }
 
 // ---------- both ----------

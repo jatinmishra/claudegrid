@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 import {
-  parseVmStat, parseTopCpu, parseSwapUsage, parsePressure, parsePmsetTherm, parseTempText, parseMeminfo, parseProcStat, cpuBetween,
-  parseLoad, pickLinuxTemp, parsePs, topByCpu, topByMem, fmtBytes, spark,
+  parseVmStat, parseTopCpu, parseSwapUsage, parsePressure, parsePmsetTherm, parseMeminfo, parseProcStat, cpuBetween,
+  parseLoad, parsePs, topByCpu, topByMem, fmtBytes, spark,
 } from '../hooks/sysmon.ts'
 import { renderSystemPane, systemText } from '../hooks/sysview.ts'
 import type { Sample } from '../hooks/sysmon.ts'
@@ -51,15 +51,7 @@ test('macOS top, swap, pressure, load and thermal state', () => {
   expect(parsePmsetTherm('').state).toBe('unknown')
 })
 
-test('temperature tools: osx-cpu-temp and istats formats, and Apple Silicon zero is no reading', () => {
-  expect(parseTempText('61.2°C')).toBe(61.2)
-  expect(parseTempText('CPU: 61.2 C')).toBe(61.2)
-  expect(parseTempText('58.50\n')).toBe(58.5)
-  expect(parseTempText('0.0°C')).toBe(null)
-  expect(parseTempText('')).toBe(null)
-})
-
-test('Linux memory, CPU deltas, load and temperature zones', () => {
+test('Linux memory, CPU deltas and load', () => {
   const mi = parseMeminfo('MemTotal: 16000000 kB\nMemFree: 2000000 kB\nMemAvailable: 9000000 kB\nBuffers: 500000 kB\nCached: 4000000 kB\nSwapTotal: 2000000 kB\nSwapFree: 1500000 kB\n')!
   expect(mi.mem.total).toBe(16000000 * 1024)
   expect(mi.mem.used).toBe(7000000 * 1024)
@@ -71,10 +63,6 @@ test('Linux memory, CPU deltas, load and temperature zones', () => {
   expect(Math.round(u.user)).toBe(10)
   expect(cpuBetween(a[0], a[0])).toBe(null) // no time passed
   expect(parseLoad('0.12 0.20 0.18 1/234 5678')).toEqual([0.12, 0.2, 0.18])
-  const t = pickLinuxTemp([{ type: 'acpitz', milli: 41000 }, { type: 'x86_pkg_temp', milli: 58000 }, { type: 'iwlwifi', milli: 70000 }])!
-  expect(t.c).toBe(58) // the CPU zone wins over a hotter wifi chip
-  expect(pickLinuxTemp([])).toBe(null)
-  expect(pickLinuxTemp([{ type: 'x', milli: 0 }])).toBe(null)
 })
 
 test('ps lines, including a name with spaces, sort by CPU and by memory', () => {
@@ -96,10 +84,10 @@ test('formatting helpers', () => {
 const sample = (over: Partial<Sample> = {}): Sample => ({
   at: 1000, platform: 'darwin', cores: 10, cpu: { total: 23, user: 15, sys: 8 }, perCore: null, load: [2.3, 2.1, 2],
   mem: { total: 16 * 1024 ** 3, used: 9 * 1024 ** 3, cached: 4 * 1024 ** 3, free: 3 * 1024 ** 3, app: 5 * 1024 ** 3, wired: 2 * 1024 ** 3, compressed: 2 * 1024 ** 3 },
-  swap: { total: 2 * 1024 ** 3, used: 1024 ** 3 }, pressure: 'normal', temp: null, thermal: { state: 'nominal' },
-  procs: [{ pid: 1, cpu: 50, rssKb: 100000, name: 'node' }, { pid: 2, cpu: 10, rssKb: 900000, name: 'Xcode' }], notes: ['Temperature: macOS gives no sensor reading without admin rights.'], ...over,
+  swap: { total: 2 * 1024 ** 3, used: 1024 ** 3 }, pressure: 'normal', thermal: { state: 'nominal' },
+  procs: [{ pid: 1, cpu: 50, rssKb: 100000, name: 'node' }, { pid: 2, cpu: 10, rssKb: 900000, name: 'Xcode' }], notes: [], ...over,
 })
-const state = (over = {}) => ({ sample: sample(), cpuHist: [10, 20, 30], memHist: [50, 55, 60], tempHist: [], loading: false, error: '', now: 4000, everyMs: 3000, ...over })
+const state = (over = {}) => ({ sample: sample(), cpuHist: [10, 20, 30], memHist: [50, 55, 60], loading: false, error: '', now: 4000, everyMs: 3000, ...over })
 const text = (c: { ch: number[] }): string => String.fromCodePoint(...c.ch)
 
 test('the SYSTEM pane draws at every size and in every state', () => {
@@ -110,16 +98,14 @@ test('the SYSTEM pane draws at every size and in every state', () => {
   }
   expect(renderSystemPane(state({ sample: null }), 100, 20).rows).toBe(20)
   expect(renderSystemPane(state({ sample: null, error: 'boom' }), 100, 20).rows).toBe(20)
-  const linux = sample({ platform: 'linux', perCore: [10, 90, 40, 5], temp: { c: 61.5, source: 'x86_pkg_temp' }, thermal: null, pressure: null, notes: [] })
-  expect(renderSystemPane(state({ sample: linux, tempHist: [55, 60, 61.5] }), 120, 34).rows).toBe(34)
+  const linux = sample({ platform: 'linux', perCore: [10, 90, 40, 5], thermal: null, pressure: null, notes: [] })
+  expect(renderSystemPane(state({ sample: linux }), 120, 34).rows).toBe(34)
 })
 
-test('the pane shows CPU, memory, temperature and processes, and says why there is no degrees reading on a Mac', () => {
+test('the pane shows CPU, memory, processes and the thermal state', () => {
   const t = text(renderSystemPane(state(), 120, 34))
-  for (const word of ['SYSTEM', 'CPU', 'MEMORY', 'TEMPERATURE', 'PROCESSES', 'COMPRESSED', 'THERMAL', 'nominal', 'Xcode']) expect(t.includes(word)).toBe(true)
-  expect(t.includes('admin rights')).toBe(true)
-  const hot = text(renderSystemPane(state({ sample: sample({ temp: { c: 71.2, source: 'osx-cpu-temp' } }) }), 120, 34))
-  expect(hot.includes('71.2')).toBe(true)
+  for (const word of ['SYSTEM', 'CPU', 'MEMORY', 'PROCESSES', 'COMPRESSED', 'THERMAL', 'nominal', 'Xcode']) expect(t.includes(word)).toBe(true)
+  expect(t.includes('TEMPERATURE')).toBe(false)
 })
 
 test('the transcript snapshot lists the readings and the process leaders', () => {

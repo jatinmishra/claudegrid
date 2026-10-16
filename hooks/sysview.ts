@@ -1,4 +1,4 @@
-// The SYSTEM tab: CPU, memory, temperature and the busiest processes, drawn like the other tabs.
+// The SYSTEM tab: CPU, memory and the busiest processes, drawn like the other tabs.
 // Pure (state in, Canvas out) so it can be tested and previewed without Claude Code.
 
 import { Canvas, C, DEFAULT, lerp3 } from './canvas.ts'
@@ -10,7 +10,6 @@ export interface SysState {
   sample: Sample | null
   cpuHist: number[]
   memHist: number[]
-  tempHist: number[]
   loading: boolean
   error: string
   now: number
@@ -176,36 +175,6 @@ function memPanel(cv: Canvas, s: SysState, x: number, y: number, w: number, h: n
   }
 }
 
-function tempPanel(cv: Canvas, s: SysState, x: number, y: number, w: number, h: number): void {
-  if (w < 24 || h < 4) return
-  const smp = s.sample
-  cv.frame(x, y, w, h, { color: C.cyan, label: 'TEMPERATURE', labelColor: C.hot })
-  const ix = x + 2
-  const iw = w - 4
-  if (!smp) { label(cv, ix, y + 1, 'reading …'); return }
-  if (smp.temp) {
-    const frac = smp.temp.c / 100
-    const e = cv.text(ix, y + 1, `${smp.temp.c.toFixed(1)}°C`, heat(frac))
-    const barW = Math.max(8, iw - 12)
-    meter(cv, e + 1, y + 1, barW, frac)
-    if (h >= 4) label(cv, ix, y + 2, `from ${clip(smp.temp.source, iw - 6)}`)
-    const th = clamp(y + h - 1 - (y + 3), 0, 4)
-    if (th >= 1) {
-      label(cv, ix, y + 3, 'TREND')
-      areaChart(cv, ix + 6, y + 3, Math.max(4, iw - 6), th, s.tempHist, 100)
-    }
-    return
-  }
-  // no reading: say what the machine reports instead, and why
-  if (smp.thermal) {
-    const t = smp.thermal
-    const e = label(cv, ix, y + 1, 'THERMAL ')
-    cv.text(e, y + 1, t.state === 'nominal' ? 'nominal (not slowed)' : t.state === 'throttled' ? `slowed to ${t.limit}% to cool` : 'unknown', t.state === 'throttled' ? C.alert : C.hot)
-  }
-  const why = wrap(smp.notes.filter((n) => /temp|thermal|sensor/i.test(n)).join(' '), iw)
-  why.slice(0, Math.max(0, h - 3)).forEach((line, i) => cv.text(ix, y + 2 + i, line, C.dim, DEFAULT, ix + iw - 1))
-}
-
 function procPanel(cv: Canvas, s: SysState, x: number, y: number, w: number, h: number): void {
   if (w < 30 || h < 4) return
   cv.frame(x, y, w, h, { color: C.cyan, label: 'PROCESSES', labelColor: C.hot })
@@ -262,8 +231,7 @@ export function renderSystemPane(s: SysState, cols: number, rows: number): Canva
     x = 2
     const cv2 = cv
     const put = (name: string, value: string, color: number = C.hot) => { const e = cv2.text(x, 2, name + ' ', C.dim); x = cv2.text(e, 2, value, color, DEFAULT, cols - 3) + 2 }
-    if (smp.temp) put('TEMP', `${smp.temp.c.toFixed(1)}°C`, heat(smp.temp.c / 100))
-    else if (smp.thermal) put('THERMAL', smp.thermal.state === 'throttled' ? `slowed to ${smp.thermal.limit}%` : smp.thermal.state, smp.thermal.state === 'throttled' ? C.alert : C.hot)
+    if (smp.thermal) put('THERMAL', smp.thermal.state === 'throttled' ? `slowed to ${smp.thermal.limit}%` : smp.thermal.state, smp.thermal.state === 'throttled' ? C.alert : C.hot)
     if (smp.cores) put('CORES', String(smp.cores), C.text)
     if (smp.pressure) put('PRESSURE', smp.pressure, smp.pressure === 'normal' ? C.hot : smp.pressure === 'warn' ? C.yellow : C.alert)
   }
@@ -278,17 +246,14 @@ export function renderSystemPane(s: SysState, cols: number, rows: number): Canva
     const cpuH = clamp(4 + Math.max(1, perCoreRows), 6, Math.floor(areaH * 0.5))
     cpuPanel(cv, s, 0, top, leftW, cpuH)
     memPanel(cv, s, 0, top + cpuH, leftW, Math.max(4, areaH - cpuH))
-    const tempH = smp?.temp ? 8 : 7
-    tempPanel(cv, s, leftW, top, cols - leftW, tempH)
-    procPanel(cv, s, leftW, top + tempH, cols - leftW, Math.max(4, areaH - tempH))
+    procPanel(cv, s, leftW, top, cols - leftW, areaH)
   } else {
-    // one column: CPU, memory, temperature, processes, each as tall as it needs and the rest dropped when short
+    // one column: CPU, memory, processes, each as tall as it needs and the rest dropped when short
     let y = top
     let left = areaH
     const place = (h: number, f: (y: number, h: number) => void) => { const hh = Math.min(h, left); if (hh >= 4) { f(y, hh); y += hh; left -= hh } }
     place(smp?.perCore ? 5 : 5, (yy, hh) => cpuPanel(cv, s, 0, yy, cols, hh))
     place(7, (yy, hh) => memPanel(cv, s, 0, yy, cols, hh))
-    place(smp?.temp ? 8 : 7, (yy, hh) => tempPanel(cv, s, 0, yy, cols, hh))
     place(Math.max(6, left), (yy, hh) => procPanel(cv, s, 0, yy, cols, hh))
   }
 
@@ -315,7 +280,7 @@ export function systemText(s: SysState): string {
     if (m.app != null) lines.push(`         app ${fmtBytes(m.app)} · wired ${fmtBytes(m.wired ?? 0)} · compressed ${fmtBytes(m.compressed ?? 0)}`)
   }
   if (smp.swap) lines.push(`swap     ${smp.swap.total > 0 ? `${fmtBytes(smp.swap.used)} of ${fmtBytes(smp.swap.total)}` : 'none'}${smp.pressure ? ` · pressure ${smp.pressure}` : ''}`)
-  lines.push(smp.temp ? `temp     ${smp.temp.c.toFixed(1)}°C (${smp.temp.source})` : smp.thermal ? `thermal  ${smp.thermal.state === 'throttled' ? `slowed to ${smp.thermal.limit}%` : smp.thermal.state} (no temperature reading)` : 'temp     not available (see the note below)')
+  if (smp.thermal) lines.push(`thermal  ${smp.thermal.state === 'throttled' ? `slowed to ${smp.thermal.limit}%` : smp.thermal.state}`)
   const cpuTop = topByCpu(smp.procs, 5)
   if (cpuTop.length) lines.push('top cpu  ' + cpuTop.map((p) => `${p.name} ${p.cpu.toFixed(0)}%`).join(' · '))
   const memTop = topByMem(smp.procs, 5)
